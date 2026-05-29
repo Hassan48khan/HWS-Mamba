@@ -1,4 +1,7 @@
 """
+hws_mamba.py
+============
+
 HWS-Mamba: Hierarchical Windowed Spatio-temporal Mamba
 for Pediatric Left Ventricle Segmentation and EF Estimation.
 
@@ -7,7 +10,6 @@ Architecture origin (strictly from two papers, nothing else):
     [HSS-Net]   - Hierarchical design: convolutional blocks at low-level
                   stages (single-frame detail) + Mamba blocks at
                   high-level stages (multi-frame spatio-temporal).
-                - Differentiable EF training signal alongside Dice/BCE.
 
     [WAS-Mamba] - Cross-channel Window Scan with half-window shifting,
                   preserving local neighbourhoods when a feature map is
@@ -17,35 +19,14 @@ Architecture origin (strictly from two papers, nothing else):
                   scan branches before fusion.
 
 HWS-Mamba simply combines and adapts these to the 2D+t pediatric LV
-segmentation problem (both A4C and PSAX, same weights).  No new module
-families beyond what already appears in HSS-Net or WAS-Mamba.
-
-Concrete adaptations
---------------------
-1. WSTCS  : WAS-Mamba's CCWScan operates on 3D volumes by walking
-            (h, w, c) inside a 2D spatial window across channels.  For
-            2D+t echo video we walk (t, h, w) inside a space-time window.
-            We keep the four-direction structure (forward/backward x
-            original/shifted) and the half-window torch.roll shifting.
-2. WSSM2D+t : WAS-Mamba's WSSM with the same spatial + frequency dual
-              embedding, applied to 2D+t feature maps instead of 3D
-              volumes.  No additional embedding branch is introduced.
-3. EF loss : HSS-Net is trained with Dice + BCE.  Their results show
-             good Dice but unsatisfactory EF.  We add a differentiable
-             Simpson EF loss term alongside Dice + BCE.  No new module.
-
-Notes
------
-- The CPU fallback path (no `mamba_ssm` available) is a pass-through so
-  that the file remains importable for shape and gradient sanity tests.
-  On GPU with the standard Mamba kernel the SSM behaves normally.
+segmentation problem (both A4C and PSAX, same weights).
 """
 
 from __future__ import annotations
 
 import math
 from functools import partial
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -118,8 +99,6 @@ class VideoPatchEmbed(nn.Module):
 
 
 class SpatialPatchMerging(nn.Module):
-    """Halve H and W, double C.  T preserved."""
-
     def __init__(self, dim: int, norm_layer=nn.LayerNorm):
         super().__init__()
         self.norm = norm_layer(4 * dim)
@@ -140,8 +119,6 @@ class SpatialPatchMerging(nn.Module):
 
 
 class SpatialPatchExpand(nn.Module):
-    """Inverse: double H and W, halve C."""
-
     def __init__(self, dim: int, norm_layer=nn.LayerNorm):
         super().__init__()
         self.expand = nn.Linear(dim, 2 * dim, bias=False)
@@ -155,8 +132,6 @@ class SpatialPatchExpand(nn.Module):
 
 
 class FinalPatchExpand(nn.Module):
-    """Restore (H, W) back to input resolution at the end of the decoder."""
-
     def __init__(self, dim: int, scale: int = 4, norm_layer=nn.LayerNorm):
         super().__init__()
         self.scale = scale
@@ -171,13 +146,11 @@ class FinalPatchExpand(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Low-level block: separable convolution (HSS-Net low-level stage)
+# Low-level block
 # ---------------------------------------------------------------------------
 
 class SepConvBlock(nn.Module):
-    """Inverted residual separable conv block applied per-frame, then a
-    feed-forward layer.  This is HSS-Net's low-level Stage 1/Stage 2
-    block, with the same Layer-Norm -> SeparableConv -> FFN structure."""
+    """Inverted residual separable conv block applied per-frame, then FFN."""
 
     def __init__(
         self,
@@ -214,16 +187,10 @@ class SepConvBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Windowed Spatio-Temporal Cross Scan (WSTCS)
-# Adaptation of WAS-Mamba's CCWScan from 3D volumes to 2D+t video.
+# WSTCS
 # ---------------------------------------------------------------------------
 
 def _make_window_index(T, H, W, Tw, Hw, Ww, device) -> torch.Tensor:
-    """Permutation of length T*H*W that re-orders a (t, h, w)-flattened
-    tensor so all tokens of one window are contiguous, windows are
-    visited in (Tw, Hw, Ww) raster order, and inside each window tokens
-    are in (t, h, w) order.  Direct analogue of WAS-Mamba's window
-    indexing, lifted to a space-time window."""
     assert T % Tw == 0 and H % Hw == 0 and W % Ww == 0
     nh, nw = H // Hw, W // Ww
     t = torch.arange(T, device=device)
@@ -242,21 +209,7 @@ def _make_window_index(T, H, W, Tw, Hw, Ww, device) -> torch.Tensor:
 
 
 class WSTCS(nn.Module):
-    """Windowed Spatio-Temporal Cross Scan.
-
-    Same idea as WAS-Mamba's CCWScan: split the feature map into windows,
-    scan inside each window, scan the windows in raster order, and run a
-    second scan on a half-window-shifted copy to recover features split
-    by the first windowing.  Difference: the window is 3D in space-time
-    (Tw, Hw, Ww), not (Hw, Ww, channels), because here we are processing
-    2D+t video.
-
-    Produces four scan paths (stacked as (B, 4, C, L)):
-        P1: forward windowed scan on the original clip
-        P2: backward windowed scan on the original clip
-        P3: forward windowed scan on the half-window shifted clip
-        P4: backward windowed scan on the shifted clip
-    """
+    """Windowed Spatio-Temporal Cross Scan; produces 4 paths (B,4,C,L)."""
 
     def __init__(self, window: Tuple[int, int, int] = (2, 4, 4)):
         super().__init__()
@@ -309,20 +262,11 @@ class WSTCS(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Weighted State-Space Module (WSSM) - WAS-Mamba's WSSM ported to 2D+t.
+# WSSM2D+t
 # ---------------------------------------------------------------------------
 
 class WSSM2Dt(nn.Module):
-    """WAS-Mamba's Weighted State-Space Module, ported from 3D volumes to
-    2D+t echo video.
-
-    Faithful port: still uses the spatial-domain depthwise prior, the
-    frequency-domain (FFT) embedding, fuses them into a single hybrid
-    embedding, runs the four scan branches through a packed selective
-    scan, and re-weights each branch with the hybrid embedding before
-    summing them.  Only the tensor rank changes (T, H, W instead of
-    D, H, W) and the scan module is the new WSTCS.
-    """
+    """WAS-Mamba's WSSM ported to 2D+t. Dual-domain reweighting of 4 paths."""
 
     def __init__(
         self,
@@ -346,20 +290,13 @@ class WSSM2Dt(nn.Module):
         self.d_inner = int(expand * d_model)
         self.dt_rank = math.ceil(d_model / 32) if dt_rank == "auto" else dt_rank
 
-        # Input projection (x and gate z), as in WAS-Mamba.
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=True)
 
-        # Spatial branch: depthwise 3D conv image prior.
         self.dw_conv = nn.Conv3d(self.d_inner, self.d_inner,
                                  kernel_size=d_conv, padding=d_conv // 2,
                                  groups=self.d_inner, bias=True)
-
-        # Frequency branch: FFT -> 1x1 conv -> iFFT, as in WAS-Mamba.
         self.fft_proj = nn.Conv3d(self.d_inner, self.d_inner,
                                   kernel_size=1, bias=True)
-
-        # Fuse spatial + frequency into the hybrid embedding used to
-        # re-weight the four scan branches (exactly the WSSM design).
         self.hybrid_fuse = nn.Sequential(
             nn.Conv3d(2 * self.d_inner, self.d_inner,
                       kernel_size=d_conv, padding=d_conv // 2,
@@ -370,7 +307,6 @@ class WSSM2Dt(nn.Module):
 
         self.scan = WSTCS(window=window)
 
-        # Selective-scan parameters, packed for 4 branches.
         K = 4
         self.x_proj_weight = nn.Parameter(torch.empty(
             K, self.dt_rank + 2 * d_state, self.d_inner))
@@ -387,7 +323,6 @@ class WSSM2Dt(nn.Module):
         self.A_logs = self._init_A_log(d_state, self.d_inner, copies=K)
         self.Ds = self._init_D(self.d_inner, copies=K)
 
-        # Per-branch reweighting using the hybrid embedding (WSSM design).
         self.branch_weight = nn.ModuleList([
             nn.Sequential(
                 nn.Conv3d(2 * self.d_inner, self.d_inner,
@@ -401,8 +336,6 @@ class WSSM2Dt(nn.Module):
         self.out_norm = nn.LayerNorm(self.d_inner)
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=True)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-    # ---- parameter init (kept identical to WAS-Mamba's WSSM) -------------
 
     def _init_dt_proj(self, dt_init, dt_scale, dt_min, dt_max, floor):
         dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
@@ -436,16 +369,11 @@ class WSSM2Dt(nn.Module):
         p = nn.Parameter(D); p._no_weight_decay = True
         return p
 
-    # ---- the two image-prior branches and the selective scan -------------
-
     def _hybrid_embedding(self, x_main: torch.Tensor) -> torch.Tensor:
-        """Spatial + frequency embedding, as in WAS-Mamba's WSSM."""
         x_sp = self.dw_conv(x_main)
-
         freq = torch.fft.fftn(x_main, dim=(2, 3, 4))
         freq = self.fft_proj(freq.real) + 1j * self.fft_proj(freq.imag)
         x_fr = torch.fft.ifftn(freq, dim=(2, 3, 4)).real
-
         return self.hybrid_fuse(torch.cat([x_sp, x_fr], dim=1))
 
     def _selective_scan_branches(self, xs: torch.Tensor) -> torch.Tensor:
@@ -470,18 +398,14 @@ class WSSM2Dt(nn.Module):
                 return_last_state=False,
             )
         else:
-            out = xs_f  # CPU pass-through for sanity testing
+            out = xs_f
         return out.view(B, K, C, L)
 
-    # ---- forward ---------------------------------------------------------
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, H, W, C)."""
         B, T, H, W, C = x.shape
-
         xz = self.in_proj(x)
         x_in, z_in = xz.chunk(2, dim=-1)
-        x_main = x_in.permute(0, 4, 1, 2, 3).contiguous()  # (B,C,T,H,W)
+        x_main = x_in.permute(0, 4, 1, 2, 3).contiguous()
 
         hybrid = self._hybrid_embedding(x_main)
 
@@ -503,13 +427,10 @@ class WSSM2Dt(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# High-level block (HSS-Net's Stage 3/4 + WAS-Mamba's WSSM)
+# High-level block
 # ---------------------------------------------------------------------------
 
 class STMambaBlock(nn.Module):
-    """HSS-Net's high-level spatio-temporal block, with WSSM2D+t as the
-    sequence mixer.  Pre-norm Mamba + pre-norm FFN."""
-
     def __init__(
         self,
         dim: int,
@@ -602,17 +523,13 @@ class DecoderStage(nn.Module):
 # ---------------------------------------------------------------------------
 
 class HWSMamba(nn.Module):
-    """HWS-Mamba: Hierarchical Windowed Spatio-temporal Mamba for
-    pediatric LV segmentation and EF estimation.
+    """HWS-Mamba: Hierarchical Windowed Spatio-temporal Mamba.
 
-    Encoder (after HSS-Net):
-        Stage 1, 2  - SepConvBlock  (per-frame, local detail)
-        Stage 3, 4  - STMambaBlock  (multi-frame, WSTCS + WSSM2D+t)
-    Decoder symmetric, with skip connections.
-    Output: per-frame LV segmentation logits.
-
-    The same weights handle both A4C and PSAX clips - there is no
-    view-specific code path.
+    Encoder:
+        Stage 1, 2  - SepConvBlock  (per-frame local detail)
+        Stage 3, 4  - STMambaBlock  (multi-frame WSTCS + WSSM2D+t)
+    Decoder symmetric with skip connections.
+    Output: per-frame LV segmentation logits of shape (B, C_out, T, H, W).
     """
 
     def __init__(
@@ -704,100 +621,13 @@ class HWSMamba(nn.Module):
         return self.seg_head(f)
 
 
-# ---------------------------------------------------------------------------
-# Losses: HSS-Net's Dice + BCE, augmented with a differentiable Simpson
-# EF loss.  No new module - just an additional scalar in the loss.
-# ---------------------------------------------------------------------------
-
-def soft_dice_loss(pred, target, eps=1e-6):
-    dims = (2, 3, 4)
-    inter = (pred * target).sum(dims)
-    union = pred.sum(dims) + target.sum(dims)
-    dice = (2 * inter + eps) / (union + eps)
-    return 1.0 - dice.mean()
-
-
-def simpson_single_plane_ef(mask: torch.Tensor,
-                            ed_idx: torch.Tensor,
-                            es_idx: torch.Tensor) -> torch.Tensor:
-    """Differentiable Simpson single-plane EF surrogate.
-
-    Per-frame "volume" is approximated by sum of cubed row sums of the
-    mask - a smooth analogue of the disk-summation rule.  Monotone in
-    the true EF, fully differentiable, suitable as a training signal.
-    """
-    B, _, T, H, W = mask.shape
-    row_sums = mask.sum(dim=-1)
-    volume = (row_sums ** 3).sum(dim=-1).squeeze(1)         # (B, T)
-    b = torch.arange(B, device=mask.device)
-    v_ed = volume[b, ed_idx]
-    v_es = volume[b, es_idx]
-    ef = (v_ed - v_es) / (v_ed + 1e-6)
-    return ef.clamp(0.0, 1.0)
-
-
-class HWSLoss(nn.Module):
-    """L_total = a * L_dice + (1 - a) * L_bce + lambda_ef * L_ef.
-
-    HSS-Net uses a * Dice + (1-a) * BCE with a = 0.8.  We retain that
-    and add a small Simpson-EF term.
-    """
-
-    def __init__(self, alpha: float = 0.8, lambda_ef: float = 0.5):
-        super().__init__()
-        self.alpha = alpha
-        self.lambda_ef = lambda_ef
-        self.bce = nn.BCEWithLogitsLoss()
-
-    def forward(self, logits, target, ed_idx, es_idx, ef_gt):
-        prob = torch.sigmoid(logits)
-        l_dice = soft_dice_loss(prob, target)
-        l_bce = self.bce(logits, target)
-        ef_pred = simpson_single_plane_ef(prob, ed_idx, es_idx)
-        l_ef = (ef_pred - ef_gt).abs().mean()
-        return self.alpha * l_dice + (1 - self.alpha) * l_bce + \
-            self.lambda_ef * l_ef
-
-
-# ---------------------------------------------------------------------------
-# Self-test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    torch.manual_seed(0)
-
-    # Small config for CPU sanity test.
-    B, C, T, H, W = 1, 1, 8, 64, 64
-    net = HWSMamba(
-        in_chans=C, num_classes=1, embed_dim=32,
-        depths=(2, 2, 2, 2), depths_decoder=(2, 2, 2, 2),
-        d_state=8, drop_path_rate=0.0,
-        patch_size=(1, 4, 4),
-        windows=((2, 4, 4),) * 4,
-    )
-    n_params = sum(p.numel() for p in net.parameters())
-    print(f"HWS-Mamba (small) parameters: {n_params/1e6:.2f} M")
-
-    x = torch.randn(B, C, T, H, W)
-    with torch.no_grad():
-        y = net(x)
-    print("input ", tuple(x.shape))
-    print("output", tuple(y.shape))
-    assert y.shape == (B, 1, T, H, W)
-
-    # Realistic config parameter count.
-    big = HWSMamba(
-        in_chans=1, num_classes=1, embed_dim=64,
+def build_hws_mamba(num_classes: int = 1, **kwargs) -> HWSMamba:
+    """Factory returning the realistic config used in the paper."""
+    defaults = dict(
+        in_chans=1, num_classes=num_classes, embed_dim=64,
         depths=(2, 2, 2, 2), depths_decoder=(2, 2, 2, 2),
         d_state=16, drop_path_rate=0.1,
+        patch_size=(1, 4, 4), windows=((2, 4, 4),) * 4,
     )
-    print(f"HWS-Mamba (realistic) parameters: "
-          f"{sum(p.numel() for p in big.parameters())/1e6:.2f} M")
-
-    # Loss sanity check.
-    target = (torch.rand_like(y) > 0.5).float()
-    ed_idx = torch.tensor([0])
-    es_idx = torch.tensor([T - 1])
-    ef_gt = torch.tensor([0.55])
-    loss = HWSLoss(alpha=0.8, lambda_ef=0.5)(y, target, ed_idx, es_idx, ef_gt)
-    print(f"loss = {loss.item():.4f}")
+    defaults.update(kwargs)
+    return HWSMamba(**defaults)
